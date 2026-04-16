@@ -136,7 +136,7 @@ jobs:
         timeout-minutes: 25
         shell: pwsh
         run: |
-          $args = "${{ inputs.url }}", "--name", "${{ inputs.name }}"
+          $args = "${{ inputs.url }}", "--name", "${{ inputs.name }}" ,"--proxy-url" "http://127.0.0.1:7890"
 
           if ("${{ inputs.icon }}" -ne "") {
             $args += "--icon", "${{ inputs.icon }}"
