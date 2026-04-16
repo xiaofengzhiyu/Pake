@@ -66,7 +66,7 @@ runs:
     - name: Install dependencies
       if: env.SETUP_NODE == 'true'
       shell: bash
-      run: pnpm install --frozen-lockfile
+      run: pnpm install --no-frozen-lockfile
 
     # Rust Environment Setup
     - name: Setup Rust for Linux
