@@ -52,6 +52,9 @@ on:
         description: "Package formats (comma-separated: deb,appimage,rpm)"
         required: false
         default: "deb"
+      proxy_url:
+        description: "Proxy URL (optional, e.g., http://127.0.0.1:7890)"
+        required: false
 
 jobs:
   build:
@@ -73,6 +76,12 @@ jobs:
         uses: ./.github/actions/setup-env
         with:
           mode: build
+
+      # Clear pnpm cache and reinstall without frozen lockfile if needed
+      - name: Clean install dependencies
+        run: |
+          pnpm install --no-frozen-lockfile
+        shell: bash
 
       - name: Build CLI
         run: pnpm run cli:build
@@ -97,37 +106,35 @@ jobs:
         if: runner.os != 'Windows'
         timeout-minutes: 25
         shell: bash
+        env:
+          HTTP_PROXY: ${{ inputs.proxy_url }}
+          HTTPS_PROXY: ${{ inputs.proxy_url }}
         run: |
           ARGS=("${{ inputs.url }}" "--name" "${{ inputs.name }}")
-
           if [ -n "${{ inputs.icon }}" ]; then
             ARGS+=("--icon" "${{ inputs.icon }}")
           fi
-
           if [ -n "${{ inputs.width }}" ]; then
             ARGS+=("--width" "${{ inputs.width }}")
           fi
-
           if [ -n "${{ inputs.height }}" ]; then
             ARGS+=("--height" "${{ inputs.height }}")
           fi
-
           if [ "${{ inputs.fullscreen }}" == "true" ]; then
             ARGS+=("--fullscreen")
           fi
-
           if [ "${{ inputs.hide_title_bar }}" == "true" ]; then
             ARGS+=("--hide-title-bar")
           fi
-
           if [ "${{ inputs.multi_arch }}" == "true" ]; then
             ARGS+=("--multi-arch")
           fi
-
           if [ -n "${{ inputs.targets }}" ] && [ "${{ runner.os }}" == "Linux" ]; then
             ARGS+=("--targets" "${{ inputs.targets }}")
           fi
-
+          if [ -n "${{ inputs.proxy_url }}" ]; then
+            ARGS+=("--proxy-url" "${{ inputs.proxy_url }}")
+          fi
           echo "Running: node dist/cli.js ${ARGS[@]}"
           node dist/cli.js "${ARGS[@]}"
 
@@ -136,31 +143,29 @@ jobs:
         timeout-minutes: 25
         shell: pwsh
         run: |
-          $args = "${{ inputs.url }}", "--name", "${{ inputs.name }}" ,"--proxy-url" "http://127.0.0.1:7890"
-
+          $args = @("${{ inputs.url }}", "--name", "${{ inputs.name }}")
+          
           if ("${{ inputs.icon }}" -ne "") {
             $args += "--icon", "${{ inputs.icon }}"
           }
-
           if ("${{ inputs.width }}" -ne "") {
             $args += "--width", "${{ inputs.width }}"
           }
-
           if ("${{ inputs.height }}" -ne "") {
             $args += "--height", "${{ inputs.height }}"
           }
-
           if ("${{ inputs.fullscreen }}" -eq "true") {
             $args += "--fullscreen"
           }
-
           if ("${{ inputs.hide_title_bar }}" -eq "true") {
             $args += "--hide-title-bar"
           }
-
+          if ("${{ inputs.proxy_url }}" -ne "") {
+            $args += "--proxy-url", "${{ inputs.proxy_url }}"
+          }
+          
           Write-Host "Running: node dist/cli.js $($args -join ' ')"
-          node dist/cli.js $args
-
+          node dist/cli.js @($args)
           git checkout -- src-tauri/Cargo.lock
 
       - name: Upload DMG (macOS)
@@ -189,6 +194,15 @@ jobs:
           retention-days: 3
           if-no-files-found: ignore
 
+      - name: Upload RPM (Linux)
+        if: runner.os == 'Linux' && contains(inputs.targets, 'rpm')
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.name }}-Linux-rpm
+          path: ${{ inputs.name }}.rpm
+          retention-days: 3
+          if-no-files-found: ignore
+
       - name: Upload MSI (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v6
@@ -208,3 +222,5 @@ jobs:
             ~/.cargo/git/db/
             src-tauri/target/
           key: ${{ runner.os }}-cargo-pake-${{ hashFiles('**/Cargo.lock') }}
+
+
