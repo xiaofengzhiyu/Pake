@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub struct WindowConfig {
     pub url: String,
     pub hide_title_bar: bool,
+    #[serde(default)]
+    pub hide_window_decorations: bool,
     pub fullscreen: bool,
     pub maximize: bool,
     pub width: f64,
@@ -26,6 +28,8 @@ pub struct WindowConfig {
     pub force_internal_navigation: bool,
     #[serde(default)]
     pub internal_url_regex: String,
+    #[serde(default)]
+    pub enable_find: bool,
     #[serde(default = "default_zoom")]
     pub zoom: u32,
     #[serde(default)]

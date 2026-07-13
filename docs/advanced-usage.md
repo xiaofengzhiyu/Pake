@@ -83,7 +83,7 @@ Send messages between web content and Pake container.
 **Web Side (JavaScript):**
 
 ```javascript
-window.__TAURI__.invoke("handle_scroll", {
+window.__TAURI__.core.invoke("handle_scroll", {
   scrollY: window.scrollY,
   scrollX: window.scrollX,
 });
@@ -104,15 +104,19 @@ Configure window properties in `pake.json`:
 
 ```json
 {
-  "windows": {
-    "width": 1200,
-    "height": 780,
-    "fullscreen": false,
-    "resizable": true
-  },
-  "hideTitleBar": true
+  "windows": [
+    {
+      "width": 1200,
+      "height": 780,
+      "fullscreen": false,
+      "resizable": true,
+      "hide_title_bar": true
+    }
+  ]
 }
 ```
+
+`hide_title_bar` is the `pake.json` key (the CLI exposes it as `--hide-title-bar`). It is only supported on macOS and is ignored on Windows and Linux. Use `hide_window_decorations` (`--hide-window-decorations`) for frameless windows on Windows and Linux.
 
 ## Static File Packaging
 
@@ -265,17 +269,7 @@ pnpm run dev
 
 #### CLI Development
 
-For CLI development with hot reloading, modify the `DEFAULT_DEV_PAKE_OPTIONS` configuration in `bin/defaults.ts`:
-
-```typescript
-export const DEFAULT_DEV_PAKE_OPTIONS: PakeCliOptions & { url: string } = {
-  ...DEFAULT_PAKE_OPTIONS,
-  url: "https://weekly.tw93.fun/en",
-  name: "Weekly",
-};
-```
-
-Then run:
+For CLI development with hot reloading, run:
 
 ```bash
 pnpm run cli:dev

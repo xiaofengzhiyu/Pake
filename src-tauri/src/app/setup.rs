@@ -39,7 +39,7 @@ pub fn set_system_tray(
 
     app.app_handle().remove_tray_by_id("pake-tray");
 
-    let tray = TrayIconBuilder::new()
+    let mut tray_builder = TrayIconBuilder::new()
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "new_window" => {
@@ -61,13 +61,18 @@ pub fn set_system_tray(
                 }
             }
             "quit" => {
-                let _ = app.save_window_state(StateFlags::all());
+                let flags = if _init_fullscreen {
+                    StateFlags::all()
+                } else {
+                    StateFlags::all() & !StateFlags::FULLSCREEN
+                };
+                let _ = app.save_window_state(flags);
                 app.exit(0);
             }
             _ => (),
         })
-        .on_tray_icon_event(move |tray, event| match event {
-            TrayIconEvent::Click { button, .. } => {
+        .on_tray_icon_event(move |tray, event| {
+            if let TrayIconEvent::Click { button, .. } = event {
                 if button == tauri::tray::MouseButton::Left {
                     if let Some(window) = tray.app_handle().get_webview_window("pake") {
                         let is_visible = window.is_visible().unwrap_or(false);
@@ -84,21 +89,23 @@ pub fn set_system_tray(
                     }
                 }
             }
-            _ => {}
-        })
-        .icon(if tray_icon_path.is_empty() {
-            app.default_window_icon()
-                .unwrap_or_else(|| panic!("Failed to get default window icon"))
-                .clone()
-        } else {
-            tauri::image::Image::from_path(tray_icon_path).unwrap_or_else(|_| {
-                // If custom tray icon fails to load, fallback to default
-                app.default_window_icon()
-                    .unwrap_or_else(|| panic!("Failed to get default window icon"))
-                    .clone()
-            })
-        })
-        .build(app)?;
+        });
+
+    let resolved_icon = if tray_icon_path.is_empty() {
+        app.default_window_icon().cloned()
+    } else {
+        tauri::image::Image::from_path(tray_icon_path)
+            .ok()
+            .or_else(|| app.default_window_icon().cloned())
+    };
+
+    if let Some(icon) = resolved_icon {
+        tray_builder = tray_builder.icon(icon);
+    } else {
+        eprintln!("[Pake] No tray icon available; tray will build without an icon.");
+    }
+
+    let tray = tray_builder.build(app)?;
 
     tray.set_icon_as_template(false)?;
     Ok(())
@@ -116,47 +123,54 @@ pub fn set_global_shortcut(
     let app_handle = app.clone();
     let shortcut_hotkey = match Shortcut::from_str(&shortcut) {
         Ok(s) => s,
-        Err(_) => return Ok(()),
+        Err(error) => {
+            eprintln!("[Pake] Invalid activation shortcut '{shortcut}': {error}");
+            return Ok(());
+        }
     };
     let last_triggered = Arc::new(Mutex::new(Instant::now()));
 
-    app_handle
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler({
-                    let last_triggered = Arc::clone(&last_triggered);
-                    move |app, event, _shortcut| {
-                        let mut last_triggered = last_triggered.lock().unwrap();
-                        if Instant::now().duration_since(*last_triggered)
-                            < Duration::from_millis(300)
-                        {
-                            return;
-                        }
-                        *last_triggered = Instant::now();
+    if let Err(error) = app_handle.plugin(
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_handler({
+                let last_triggered = Arc::clone(&last_triggered);
+                move |app, event, _shortcut| {
+                    let Ok(mut last_triggered) = last_triggered.lock() else {
+                        return;
+                    };
+                    if Instant::now().duration_since(*last_triggered) < Duration::from_millis(300) {
+                        return;
+                    }
+                    *last_triggered = Instant::now();
 
-                        if shortcut_hotkey.eq(event) {
-                            if let Some(window) = app.get_webview_window("pake") {
-                                let is_visible = window.is_visible().unwrap_or(false);
-                                if is_visible {
-                                    let _ = window.hide();
-                                } else {
-                                    let _ = window.show();
-                                    let _ = window.set_focus();
-                                    #[cfg(target_os = "linux")]
-                                    if _init_fullscreen && !window.is_fullscreen().unwrap_or(false)
-                                    {
-                                        let _ = window.set_fullscreen(true);
-                                    }
+                    if shortcut_hotkey.eq(event) {
+                        if let Some(window) = app.get_webview_window("pake") {
+                            let is_visible = window.is_visible().unwrap_or(false);
+                            if is_visible {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                                #[cfg(target_os = "linux")]
+                                if _init_fullscreen && !window.is_fullscreen().unwrap_or(false) {
+                                    let _ = window.set_fullscreen(true);
                                 }
                             }
                         }
                     }
-                })
-                .build(),
-        )
-        .expect("Failed to set global shortcut");
+                }
+            })
+            .build(),
+    ) {
+        eprintln!(
+            "[Pake] Failed to register global shortcut plugin '{shortcut}': {error}; continuing without it."
+        );
+        return Ok(());
+    }
 
-    let _ = app.global_shortcut().register(shortcut_hotkey);
+    if let Err(error) = app.global_shortcut().register(shortcut_hotkey) {
+        eprintln!("[Pake] Failed to bind global shortcut '{shortcut}': {error}");
+    }
 
     Ok(())
 }

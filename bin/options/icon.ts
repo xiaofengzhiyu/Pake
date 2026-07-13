@@ -17,7 +17,12 @@ import {
 } from '@/utils/icon-source';
 import { generateLinuxPackageName, getSafeAppName } from '@/utils/name';
 import { PakeAppOptions } from '@/types';
-import { writeIcoWithPreferredSize, buildIcoFromPngBuffers } from '@/utils/ico';
+import {
+  ensureMultiResolutionIco,
+  writeIcoWithPreferredSize,
+  buildIcoFromPngBuffers,
+  WIN_STANDARD_ICO_SIZES,
+} from '@/utils/ico';
 
 type PlatformIconConfig = {
   format: string;
@@ -43,7 +48,7 @@ const ICON_CONFIG = {
 } as const;
 
 const PLATFORM_CONFIG: Record<'win' | 'linux' | 'macos', PlatformIconConfig> = {
-  win: { format: '.ico', sizes: [16, 32, 48, 64, 128, 256] },
+  win: { format: '.ico', sizes: [...WIN_STANDARD_ICO_SIZES] },
   linux: { format: '.png', size: 512 },
   macos: { format: '.icns', sizes: [16, 32, 64, 128, 256, 512, 1024] },
 };
@@ -89,14 +94,23 @@ async function copyWindowsIconIfNeeded(
   try {
     const finalIconPath = generateIconPath(appName);
     await fsExtra.ensureDir(path.dirname(finalIconPath));
-    // Reorder ICO to prioritize 256px icons for better Windows display
-    const reordered = await writeIcoWithPreferredSize(
+    // Re-render ICO so every Windows standard size is present and prefer the
+    // 256px frame as the leading entry; falls back to plain reordering if the
+    // ICO is non-decodable, then to a raw copy. (Issue #1190)
+    const upgraded = await ensureMultiResolutionIco(
       convertedPath,
       finalIconPath,
       256,
     );
-    if (!reordered) {
-      await fsExtra.copy(convertedPath, finalIconPath);
+    if (!upgraded) {
+      const reordered = await writeIcoWithPreferredSize(
+        convertedPath,
+        finalIconPath,
+        256,
+      );
+      if (!reordered) {
+        await fsExtra.copy(convertedPath, finalIconPath);
+      }
     }
     return finalIconPath;
   } catch (error) {
@@ -211,9 +225,10 @@ async function convertIconFormat(
         platformOutputDir,
         `${iconName}_256${PLATFORM_CONFIG.win.format}`,
       );
+      const sourceBuffer = await fsExtra.readFile(processedInputPath);
       const frames = await Promise.all(
         (PLATFORM_CONFIG.win.sizes as number[]).map(async (size) => {
-          const png = await sharp(processedInputPath)
+          const png = await sharp(sourceBuffer)
             .resize(size, size, {
               fit: 'contain',
               background: { r: 0, g: 0, b: 0, alpha: 0 },
@@ -267,6 +282,22 @@ async function convertIconFormat(
   }
 }
 
+async function isLinuxBundleIconReady(iconPath: string): Promise<boolean> {
+  if (!IS_LINUX || path.extname(iconPath).toLowerCase() !== '.png') {
+    return false;
+  }
+
+  try {
+    const { width, height } = await sharp(iconPath).metadata();
+    return (
+      width === PLATFORM_CONFIG.linux.size &&
+      height === PLATFORM_CONFIG.linux.size
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Processes downloaded or local icon for platform-specific format
  */
@@ -280,7 +311,7 @@ async function processIcon(
   const ext = path.extname(iconPath).toLowerCase();
   const isCorrectFormat =
     (IS_WIN && ext === '.ico') ||
-    (IS_LINUX && ext === '.png') ||
+    (IS_LINUX && (await isLinuxBundleIconReady(iconPath))) ||
     (!IS_WIN && !IS_LINUX && ext === '.icns');
 
   if (isCorrectFormat) {
