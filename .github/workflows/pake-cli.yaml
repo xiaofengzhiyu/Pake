@@ -65,6 +65,9 @@ on:
       proxy_url:
         description: "Proxy URL (optional, e.g., http://127.0.0.1:7890)"
         required: false
+      inject:
+        description: "JS/CSS files to inject (comma-separated, repo-relative paths, e.g. scripts/strip-inline-css.js)"
+        required: false
 
 jobs:
   build:
@@ -145,6 +148,13 @@ jobs:
           if [ -n "${{ inputs.proxy_url }}" ]; then
             ARGS+=("--proxy-url" "${{ inputs.proxy_url }}")
           fi
+          if [ -n "${{ inputs.inject }}" ]; then
+            IFS=',' read -ra INJECT_FILES <<< "${{ inputs.inject }}"
+            for f in "${INJECT_FILES[@]}"; do
+              f_trimmed="$(echo -n "$f" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+              ARGS+=("--inject" "$f_trimmed")
+            done
+          fi
           echo "Running: node dist/cli.js ${ARGS[@]}"
           node dist/cli.js "${ARGS[@]}"
 
@@ -173,7 +183,15 @@ jobs:
           if ("${{ inputs.proxy_url }}" -ne "") {
             $args += "--proxy-url", "${{ inputs.proxy_url }}"
           }
-          
+          if ("${{ inputs.inject }}" -ne "") {
+            $injectFiles = "${{ inputs.inject }}" -split ","
+            foreach ($f in $injectFiles) {
+              $f = $f.Trim()
+              if ($f -ne "") {
+                $args += "--inject", $f
+              }
+            }
+          }
           Write-Host "Running: node dist/cli.js $($args -join ' ')"
           node dist/cli.js @($args)
           git checkout -- src-tauri/Cargo.lock
