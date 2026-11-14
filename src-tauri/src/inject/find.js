@@ -199,9 +199,7 @@
       return;
     }
 
-    const style = document.createElement("style");
-    style.id = STYLE_ID;
-    style.textContent = `
+    const css = `
       #${PANEL_ID} {
         position: fixed;
         top: 14px;
@@ -312,9 +310,16 @@
       }
     `;
 
-    (document.head || document.body || document.documentElement)?.appendChild(
-      style,
-    );
+    if (typeof window.__PAKE_INJECT_STYLE__ === "function") {
+      window.__PAKE_INJECT_STYLE__(css, STYLE_ID);
+    } else {
+      const style = document.createElement("style");
+      style.id = STYLE_ID;
+      style.textContent = css;
+      (document.head || document.body || document.documentElement)?.appendChild(
+        style,
+      );
+    }
   }
 
   function createButton(label, title, onClick) {
@@ -522,29 +527,39 @@
   }
 
   function runSearch(query = state.query) {
+    clearTimeout(state.searchTimer);
     state.query = query;
-    clearHighlights();
+    // A full scan includes any pending page edits. Disconnect while replacing
+    // DOM marks so our own mutations cannot schedule another search.
+    stopObservingDocumentChanges();
+    try {
+      clearHighlights();
 
-    if (!query) {
-      state.matches = [];
-      state.activeIndex = -1;
-      state.truncated = false;
+      if (!query) {
+        state.matches = [];
+        state.activeIndex = -1;
+        state.truncated = false;
+        updateCounter();
+        return getState();
+      }
+
+      const result = collectMatches(query);
+      state.matches = result.matches;
+      state.truncated = result.truncated;
+      state.activeIndex = state.matches.length > 0 ? 0 : -1;
+
+      if (!applyCustomHighlights()) {
+        applyDomHighlights();
+      }
+
       updateCounter();
+      scrollActiveIntoView();
       return getState();
+    } finally {
+      if (state.isOpen) {
+        observeDocumentChanges();
+      }
     }
-
-    const result = collectMatches(query);
-    state.matches = result.matches;
-    state.truncated = result.truncated;
-    state.activeIndex = state.matches.length > 0 ? 0 : -1;
-
-    if (!applyCustomHighlights()) {
-      applyDomHighlights();
-    }
-
-    updateCounter();
-    scrollActiveIntoView();
-    return getState();
   }
 
   function debounceSearch(query) {
@@ -663,9 +678,11 @@
   function getFindShortcutAction(event) {
     const userAgent = navigator.userAgent || "";
     const isMac = /macintosh|mac os x/i.test(userAgent);
-    const hasModifier = isMac
-      ? event.metaKey && !event.ctrlKey
-      : event.ctrlKey && !event.metaKey;
+    if (isMac) {
+      return "";
+    }
+
+    const hasModifier = event.ctrlKey && !event.metaKey;
 
     if (!hasModifier || event.altKey) {
       return "";
@@ -681,14 +698,19 @@
     return "";
   }
 
+  // The page gets the shortcut first: listening on window in the bubble phase runs after the
+  // page's own element and document handlers, and a page with its own find (Notion, Google
+  // Docs) calls preventDefault, so Pake's panel stays out of its way. Propagation is left alone.
   function handleFindShortcut(event) {
+    if (event.defaultPrevented) {
+      return;
+    }
     const action = getFindShortcutAction(event);
     if (!action) {
       return;
     }
 
     event.preventDefault();
-    event.stopPropagation();
     window.pakeFind[action]();
   }
 
@@ -703,6 +725,6 @@
   };
 
   if (state.enabled) {
-    document.addEventListener("keydown", handleFindShortcut, true);
+    window.addEventListener("keydown", handleFindShortcut);
   }
 })();

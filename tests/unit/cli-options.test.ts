@@ -1,9 +1,35 @@
+import { Command, InvalidArgumentError } from 'commander';
 import { describe, expect, it } from 'vitest';
 import { getCliProgram } from '../../bin/helpers/cli-program.js';
 import { validateNumberInput } from '../../bin/utils/validate.js';
 
 describe('CLI options', () => {
   const program = getCliProgram();
+
+  it.each([{ args: [] }, { args: ['--no-restore-last-url'] }])(
+    'keeps URL restoration on by default and parses the opt-out: $args',
+    ({ args }) => {
+      const option = program.options.find(
+        (item) => item.long === '--no-restore-last-url',
+      );
+      expect(option).toBeDefined();
+      const command = new Command().addOption(option!);
+      command.parse(args, { from: 'user' });
+      expect(command.opts().restoreLastUrl).toBe(args.length === 0);
+      expect(command.getOptionValueSource('restoreLastUrl')).toBe(
+        args.length === 0 ? 'default' : 'cli',
+      );
+    },
+  );
+
+  it('describes --icon platform formats including Icon Composer packages', () => {
+    const option = program.options.find((item) => item.long === '--icon');
+    expect(option).toBeDefined();
+    expect(option?.description).toContain('.icon');
+    expect(option?.description).toContain('.icns');
+    expect(option?.description).toContain('.ico');
+    expect(option?.description).toContain('.png');
+  });
 
   it('shows meta options in help', () => {
     const help = program.helpInformation();
@@ -27,6 +53,25 @@ describe('CLI options', () => {
 
     expect(option).toBeDefined();
     expect(option?.defaultValue).toBe(false);
+  });
+
+  it('registers hidden --basic-auth as a runtime opt-in', () => {
+    const option = program.options.find((item) => item.long === '--basic-auth');
+
+    expect(option).toBeDefined();
+    expect(option?.defaultValue).toBe(false);
+    expect(option?.hidden).toBe(true);
+    expect(option?.required).toBe(false);
+    expect(option?.optional).toBe(false);
+  });
+
+  it('registers password autosave as a hidden Windows opt-in', () => {
+    const option = program.options.find(
+      (item) => item.long === '--password-autosave',
+    );
+    expect(option?.defaultValue).toBe(false);
+    expect(option?.hidden).toBe(true);
+    expect(option?.required).toBe(false);
   });
 
   it('exposes --internal-url-regex option', () => {
@@ -105,6 +150,21 @@ describe('CLI options', () => {
     expect(() => option?.parseArg?.('99.5', undefined)).toThrow(
       '--zoom must be an integer between 50 and 200',
     );
+  });
+
+  it('reports rejected zoom and hide-on-close values as invalid arguments', () => {
+    // Commander only treats InvalidArgumentError as a parse error, which
+    // bin/cli.ts reports as INVALID_INPUT (exit 2, JSON result with --json).
+    for (const [flag, value] of [
+      ['--zoom', '99.5'],
+      ['--hide-on-close', 'maybe'],
+    ]) {
+      const option = program.options.find((item) => item.long === flag);
+      expect(option).toBeDefined();
+      expect(() => option?.parseArg?.(value, undefined)).toThrow(
+        InvalidArgumentError,
+      );
+    }
   });
 
   it('rejects non-finite numeric option values', () => {

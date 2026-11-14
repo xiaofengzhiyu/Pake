@@ -133,7 +133,44 @@ describe("Workflow path integration", () => {
       expect(workflow).toContain("Upload AppImage (Linux)");
       expect(workflow).toContain("Upload RPM (Linux)");
       expect(workflow).toContain("Upload ZST (Linux)");
-      expect(workflow).toContain("path: ${{ inputs.name }}-*.pkg.tar.zst");
+      // The CLI lowercases and hyphenates Linux names, so uploads must not
+      // assume the package is named after the raw name input.
+      for (const ext of ["deb", "AppImage", "rpm", "pkg.tar.zst"]) {
+        expect(workflow).toContain(`path: "*.${ext}"`);
+      }
+      expect(workflow).not.toMatch(
+        /path: \$\{\{ inputs\.name \}\}\.(deb|AppImage|rpm)/,
+      );
+    });
+
+    it.each([
+      ".github/workflows/pake-cli.yaml",
+      ".github/workflows/single-app.yaml",
+    ])(
+      "passes inputs to %s scripts through env, not shell interpolation",
+      (file) => {
+        // Windows checkouts use CRLF; normalize so the split sees each step.
+        const workflow = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
+        const scripts = workflow
+          .split(/\n\s+run: \|\n/)
+          .slice(1)
+          .map((rest) => rest.split(/\n\s{6}- (?:name|uses):/)[0]);
+        expect(scripts.length).toBeGreaterThan(0);
+        for (const script of scripts) {
+          expect(script).not.toMatch(/\$\{\{\s*inputs\./);
+        }
+      },
+    );
+
+    it("should forward the new-window input on every platform", () => {
+      const workflow = fs.readFileSync(
+        ".github/workflows/pake-cli.yaml",
+        "utf8",
+      );
+
+      expect(workflow).toContain("new_window:");
+      expect(workflow).toContain('ARGS+=("--new-window")');
+      expect(workflow).toContain('$args += "--new-window"');
     });
   });
 
@@ -253,6 +290,20 @@ describe("Workflow path integration", () => {
       // After normalization, should use consistent separator
       const parts = normalized.split(path.sep);
       expect(parts.length).toBeGreaterThan(1);
+    });
+  });
+
+  describe("npm package boundaries", () => {
+    it("excludes generated Tauri build state from the shipped template", () => {
+      const ignoredPaths = fs
+        .readFileSync("src-tauri/.npmignore", "utf8")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith("#"));
+
+      expect(ignoredPaths).toEqual(
+        expect.arrayContaining([".pake/", "target/", ".cargo/config.toml"]),
+      );
     });
   });
 });

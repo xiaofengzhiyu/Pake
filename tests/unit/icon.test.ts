@@ -1,11 +1,110 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import sharp from 'sharp';
+import http from 'http';
 
-import { downloadIcon } from '@/options/icon';
+const execaMock = vi.hoisted(() => vi.fn());
+
+vi.mock('execa', () => ({
+  execa: execaMock,
+}));
+
+import { downloadIcon, generateMacOSIcns, handleIcon } from '@/options/icon';
 import { getIconSourcePriority } from '@/utils/icon-source';
+import { beginBuildCancellation } from '@/utils/build-workspace';
+import { DEFAULT_PAKE_OPTIONS } from '@/defaults';
 
 const downloadedIconPaths: string[] = [];
+const generatedIconDirs: string[] = [];
+
+it('keeps the download deadline active until the response body completes', async () => {
+  let bodyCompleted = false;
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'image/png' });
+    response.flushHeaders();
+    const timer = setTimeout(() => {
+      bodyCompleted = true;
+      response.end('x');
+    }, 500);
+    response.on('close', () => clearTimeout(timer));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const port = (server.address() as import('net').AddressInfo).port;
+    expect(
+      await downloadIcon(`http://127.0.0.1:${port}/icon`, false, 50),
+    ).toBeNull();
+    expect(bodyCompleted).toBe(false);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+it.each(['SIGINT', 'SIGTERM'] as const)(
+  'cancels an in-flight icon response on %s',
+  async (signal) => {
+    let requestStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      requestStarted = resolve;
+    });
+    const server = http.createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'image/png' });
+      response.flushHeaders();
+      requestStarted();
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, '127.0.0.1', resolve),
+    );
+    const endCancellation = beginBuildCancellation();
+    try {
+      const port = (server.address() as import('net').AddressInfo).port;
+      const download = downloadIcon(
+        `http://127.0.0.1:${port}/icon`,
+        false,
+        2000,
+      );
+      const cancelled = expect(download).rejects.toThrow(
+        `Build cancelled (${signal}).`,
+      );
+      await started;
+      const cancelledAt = performance.now();
+      process.emit(signal, signal);
+      await cancelled;
+      expect(performance.now() - cancelledAt).toBeLessThan(1000);
+    } finally {
+      endCancellation();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+);
+
+it('does not try another favicon source after the build is cancelled', async () => {
+  const endCancellation = beginBuildCancellation();
+  const fetchMock = vi.fn(async () => {
+    process.emit('SIGINT', 'SIGINT');
+    throw new Error('Request interrupted');
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  try {
+    await expect(
+      handleIcon(
+        {
+          ...DEFAULT_PAKE_OPTIONS,
+          name: 'CancelProbe',
+          identifier: 'com.pake.cancelprobe',
+        },
+        'https://example.com',
+      ),
+    ).rejects.toThrow('Build cancelled (SIGINT).');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  } finally {
+    endCancellation();
+  }
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -22,6 +121,66 @@ afterEach(() => {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
   }
+
+  while (generatedIconDirs.length > 0) {
+    const tempDir = generatedIconDirs.pop();
+    if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+});
+
+describe('generateMacOSIcns', () => {
+  it('builds a complete iconset before calling the system converter', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pake-icns-'));
+    generatedIconDirs.push(tempDir);
+    const sourcePath = path.join(tempDir, 'source.svg');
+    fs.writeFileSync(
+      sourcePath,
+      '<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024"><rect width="1024" height="1024" fill="#123456"/></svg>',
+    );
+
+    const expectedSizes = new Map([
+      ['icon_16x16.png', 16],
+      ['icon_16x16@2x.png', 32],
+      ['icon_32x32.png', 32],
+      ['icon_32x32@2x.png', 64],
+      ['icon_128x128.png', 128],
+      ['icon_128x128@2x.png', 256],
+      ['icon_256x256.png', 256],
+      ['icon_256x256@2x.png', 512],
+      ['icon_512x512.png', 512],
+      ['icon_512x512@2x.png', 1024],
+    ]);
+
+    execaMock.mockImplementation(async (command: string, args: string[]) => {
+      expect(command).toBe('/usr/bin/iconutil');
+      expect(args.slice(0, 2)).toEqual(['-c', 'icns']);
+
+      const iconsetPath = args[2];
+      const outputPath = args[4];
+      expect(fs.readdirSync(iconsetPath).sort()).toEqual(
+        [...expectedSizes.keys()].sort(),
+      );
+
+      for (const [fileName, size] of expectedSizes) {
+        const metadata = await sharp(
+          path.join(iconsetPath, fileName),
+        ).metadata();
+        expect(metadata.width).toBe(size);
+        expect(metadata.height).toBe(size);
+      }
+
+      fs.writeFileSync(outputPath, 'test-icns');
+      return { exitCode: 0 };
+    });
+
+    const outputPath = await generateMacOSIcns(sourcePath, tempDir, 'example');
+
+    expect(outputPath).toBe(path.join(tempDir, 'example.icns'));
+    expect(fs.readFileSync(outputPath, 'utf8')).toBe('test-icns');
+    expect(execaMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('icon source priority', () => {

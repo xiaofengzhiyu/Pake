@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { runInNewContext } from "node:vm";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 function createElement(tagName) {
   const element = {
@@ -24,6 +24,12 @@ function createElement(tagName) {
     },
     append(...children) {
       children.forEach((child) => element.appendChild(child));
+    },
+    remove() {
+      const siblings = element.parentElement?.children;
+      if (siblings) siblings.splice(siblings.indexOf(element), 1);
+      element.parentElement = null;
+      element.parentNode = null;
     },
     addEventListener(type, handler) {
       element.listeners = element.listeners || {};
@@ -75,7 +81,7 @@ function createTextNode(value, parent) {
   };
 }
 
-function createDocument(textNodes) {
+function createDocument(textNodes, notifyMutation = () => {}) {
   const listeners = {};
   const body = createElement("body");
   const head = createElement("head");
@@ -108,6 +114,10 @@ function createDocument(textNodes) {
             this.start,
             this.end,
           );
+          notifyMutation({
+            type: "childList",
+            target: this.startContainer.parentNode,
+          });
         },
       };
     },
@@ -135,6 +145,7 @@ function createDocument(textNodes) {
     querySelectorAll() {
       return [];
     },
+    adoptedStyleSheets: [],
   };
 
   return document;
@@ -164,11 +175,27 @@ function loadFindScript({
   enabled = true,
   userAgent = "Mozilla/5.0",
   nodes = [],
+  observeMutations = false,
 } = {}) {
   const source = fs.readFileSync(
     path.join(process.cwd(), "src-tauri/src/inject/find.js"),
     "utf-8",
   );
+  const styleSource = fs.readFileSync(
+    path.join(process.cwd(), "src-tauri/src/inject/styles.js"),
+    "utf-8",
+  );
+  const observers = new Set();
+  const notifyMutation = (record) => {
+    for (const observer of observers) {
+      observer.records.push(record);
+      queueMicrotask(() => {
+        if (observer.records.length) {
+          observer.callback(observer.records.splice(0));
+        }
+      });
+    }
+  };
   const context = {
     console,
     setTimeout,
@@ -181,15 +208,41 @@ function loadFindScript({
       FILTER_REJECT: 2,
     },
     window: {
+      listeners: {},
+      addEventListener(type, handler, options) {
+        this.listeners[type] = this.listeners[type] || [];
+        this.listeners[type].push({ handler, options });
+      },
       pakeConfig: { enable_find: enabled },
+      CSSStyleSheet: class CSSStyleSheet {
+        replaceSync(css) {
+          this.cssText = css;
+        }
+      },
     },
-    document: createDocument(nodes),
+    document: createDocument(nodes, notifyMutation),
   };
+  if (observeMutations) {
+    context.MutationObserver = class {
+      constructor(callback) {
+        this.callback = callback;
+        this.records = [];
+      }
+      observe() {
+        observers.add(this);
+      }
+      disconnect() {
+        observers.delete(this);
+        this.records = [];
+      }
+    };
+  }
   context.window.NodeFilter = context.NodeFilter;
   context.window.navigator = context.navigator;
 
+  runInNewContext(styleSource, context);
   runInNewContext(source, context);
-  return context;
+  return { ...context, notifyMutation };
 }
 
 describe("Find injection", () => {
@@ -200,7 +253,7 @@ describe("Find injection", () => {
       nodes: [createTextNode("Alpha alpha", paragraph)],
     });
 
-    expect(context.document.listeners.keydown).toBeUndefined();
+    expect(context.window.listeners.keydown).toBeUndefined();
     expect(context.window.pakeFind.getState().enabled).toBe(false);
     expect(
       context.window.pakeFind.getFindShortcutAction(
@@ -223,7 +276,7 @@ describe("Find injection", () => {
     context.window.pakeFind.next = () => calls.push("next");
     context.window.pakeFind.previous = () => calls.push("previous");
 
-    const [listener] = context.document.listeners.keydown;
+    const [listener] = context.window.listeners.keydown;
 
     const findEvent = createKeyboardEvent("f", { ctrlKey: true });
     listener.handler(findEvent);
@@ -237,10 +290,33 @@ describe("Find injection", () => {
 
     expect(calls).toEqual(["open", "next", "previous"]);
     expect(findEvent.defaultPrevented).toBe(true);
-    expect(previousEvent.propagationStopped).toBe(true);
+    expect(previousEvent.propagationStopped).toBeFalsy();
   });
 
-  it("uses the macOS modifier for Find shortcuts", () => {
+  it("lets a page with its own find keep the shortcut", () => {
+    const context = loadFindScript({ enabled: true });
+    const calls = [];
+    context.window.pakeFind.open = () => calls.push("open");
+
+    const [listener] = context.window.listeners.keydown;
+    expect(listener.options).toBeUndefined();
+
+    const handled = createKeyboardEvent("f", { ctrlKey: true });
+    handled.preventDefault();
+    listener.handler(handled);
+
+    expect(calls).toEqual([]);
+  });
+
+  it("uses the shared style injector for the find panel", () => {
+    const context = loadFindScript({ enabled: true });
+
+    expect(context.window.pakeFind.open().isOpen).toBe(true);
+    expect(context.document.adoptedStyleSheets).toHaveLength(1);
+    expect(context.document.head.children).toHaveLength(0);
+  });
+
+  it("leaves macOS Find shortcuts to the native menu", () => {
     const context = loadFindScript({
       enabled: true,
       userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
@@ -248,11 +324,11 @@ describe("Find injection", () => {
     const calls = [];
     context.window.pakeFind.open = () => calls.push("open");
 
-    const [listener] = context.document.listeners.keydown;
+    const [listener] = context.window.listeners.keydown;
     listener.handler(createKeyboardEvent("f", { ctrlKey: true }));
     listener.handler(createKeyboardEvent("f", { metaKey: true }));
 
-    expect(calls).toEqual(["open"]);
+    expect(calls).toEqual([]);
   });
 
   it("counts text matches and skips input and script content", () => {
@@ -284,5 +360,46 @@ describe("Find injection", () => {
 
     context.window.pakeFind.close();
     expect(context.window.pakeFind.getState().matchCount).toBe(0);
+  });
+
+  it("ignores its own DOM highlights but searches real changes and stops on close", async () => {
+    vi.useFakeTimers();
+    try {
+      const paragraph = createElement("p");
+      const node = createTextNode("Alpha alpha", paragraph);
+      const context = loadFindScript({ nodes: [node], observeMutations: true });
+      const walk = vi.spyOn(context.document, "createTreeWalker");
+      const find = context.window.pakeFind;
+      find.open();
+      find.search("alpha");
+      await vi.advanceTimersByTimeAsync(650);
+      expect(walk).toHaveBeenCalledTimes(1);
+      expect(find.getState().matchCount).toBe(2);
+
+      node.nodeValue = "Alpha alpha alpha";
+      context.notifyMutation({ type: "characterData", target: node });
+      await vi.advanceTimersByTimeAsync(650);
+      expect(walk).toHaveBeenCalledTimes(2);
+      expect(find.getState().matchCount).toBe(3);
+
+      node.nodeValue = "Alpha alpha alpha alpha";
+      context.notifyMutation({ type: "characterData", target: node });
+      find.search("alpha");
+      await vi.advanceTimersByTimeAsync(650);
+      expect(walk).toHaveBeenCalledTimes(3);
+      expect(find.getState().matchCount).toBe(4);
+
+      context.notifyMutation({ type: "characterData", target: node });
+      await Promise.resolve();
+      find.close();
+      node.nodeValue = "Alpha";
+      context.notifyMutation({ type: "characterData", target: node });
+      await vi.advanceTimersByTimeAsync(650);
+      expect(walk).toHaveBeenCalledTimes(3);
+      expect(find.getState().isOpen).toBe(false);
+      expect(find.getState().matchCount).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

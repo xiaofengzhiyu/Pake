@@ -3,8 +3,7 @@ import fsExtra from 'fs-extra';
 import chalk from 'chalk';
 import { dir } from 'tmp-promise';
 import { fileTypeFromBuffer } from 'file-type';
-import icongen from 'icon-gen';
-import sharp from 'sharp';
+import { execa } from 'execa';
 
 import logger from './logger';
 import { getSpinner } from '@/utils/info';
@@ -18,17 +17,33 @@ import {
 import { generateLinuxPackageName, getSafeAppName } from '@/utils/name';
 import { PakeAppOptions } from '@/types';
 import {
+  getBuildCancellationSignal,
+  throwIfBuildCancelled,
+} from '@/utils/build-workspace';
+import {
   ensureMultiResolutionIco,
   writeIcoWithPreferredSize,
   buildIcoFromPngBuffers,
   WIN_STANDARD_ICO_SIZES,
 } from '@/utils/ico';
+import {
+  iconPathExtension,
+  isIconComposerUrl,
+  isMacOSIconComposerPackage,
+} from '@/helpers/icon-composer';
 
 type PlatformIconConfig = {
   format: string;
   sizes?: number[];
   size?: number;
 };
+
+type Sharp = (typeof import('sharp'))['default'];
+
+async function loadSharp(): Promise<Sharp> {
+  return (await import('sharp')).default;
+}
+
 const ICON_CONFIG = {
   minFileSize: 100,
   supportedFormats: [
@@ -38,6 +53,7 @@ const ICON_CONFIG = {
     'jpg',
     'webp',
     'icns',
+    'icon',
     'svg',
   ] as const,
   transparentBackground: { r: 255, g: 255, b: 255, alpha: 0 },
@@ -50,8 +66,21 @@ const ICON_CONFIG = {
 const PLATFORM_CONFIG: Record<'win' | 'linux' | 'macos', PlatformIconConfig> = {
   win: { format: '.ico', sizes: [...WIN_STANDARD_ICO_SIZES] },
   linux: { format: '.png', size: 512 },
-  macos: { format: '.icns', sizes: [16, 32, 64, 128, 256, 512, 1024] },
+  macos: { format: '.icns' },
 };
+
+const MACOS_ICONSET_FILES = [
+  ['icon_16x16.png', 16],
+  ['icon_16x16@2x.png', 32],
+  ['icon_32x32.png', 32],
+  ['icon_32x32@2x.png', 64],
+  ['icon_128x128.png', 128],
+  ['icon_128x128@2x.png', 256],
+  ['icon_256x256.png', 256],
+  ['icon_256x256@2x.png', 512],
+  ['icon_512x512.png', 512],
+  ['icon_512x512@2x.png', 1024],
+] as const;
 
 const API_KEYS = {
   logoDev: ['pk_JLLMUKGZRpaG5YclhXaTkg', 'pk_Ph745P8mQSeYFfW2Wk039A'],
@@ -134,6 +163,7 @@ async function preprocessIcon(inputPath: string): Promise<string> {
       return inputPath;
     }
 
+    const sharp = await loadSharp();
     const { path: tempDir } = await dir();
     const outputPath = path.join(tempDir, 'icon-normalized.png');
 
@@ -153,6 +183,7 @@ async function preprocessIcon(inputPath: string): Promise<string> {
  */
 async function applyMacOSMask(inputPath: string): Promise<string> {
   try {
+    const sharp = await loadSharp();
     const { path: tempDir } = await dir();
     const outputPath = path.join(tempDir, 'icon-macos-rounded.png');
 
@@ -202,6 +233,44 @@ async function applyMacOSMask(inputPath: string): Promise<string> {
   }
 }
 
+export async function generateMacOSIcns(
+  inputPath: string,
+  outputDir: string,
+  iconName: string,
+): Promise<string> {
+  const sharp = await loadSharp();
+  const iconsetPath = path.join(outputDir, `${iconName}.iconset`);
+  const outputPath = path.join(
+    outputDir,
+    `${iconName}${PLATFORM_CONFIG.macos.format}`,
+  );
+  await fsExtra.ensureDir(iconsetPath);
+
+  const source = sharp(inputPath);
+  await Promise.all(
+    MACOS_ICONSET_FILES.map(async ([fileName, size]) => {
+      await source
+        .clone()
+        .resize(size, size, {
+          fit: 'contain',
+          background: ICON_CONFIG.transparentBackground,
+        })
+        .ensureAlpha()
+        .png()
+        .toFile(path.join(iconsetPath, fileName));
+    }),
+  );
+
+  await execa('/usr/bin/iconutil', [
+    '-c',
+    'icns',
+    iconsetPath,
+    '-o',
+    outputPath,
+  ]);
+  return outputPath;
+}
+
 /**
  * Converts icon to platform-specific format
  */
@@ -221,6 +290,7 @@ async function convertIconFormat(
 
     // Generate platform-specific format
     if (IS_WIN) {
+      const sharp = await loadSharp();
       const icoPath = path.join(
         platformOutputDir,
         `${iconName}_256${PLATFORM_CONFIG.win.format}`,
@@ -245,6 +315,7 @@ async function convertIconFormat(
     }
 
     if (IS_LINUX) {
+      const sharp = await loadSharp();
       const outputPath = path.join(
         platformOutputDir,
         `${iconName}_${PLATFORM_CONFIG.linux.size}${PLATFORM_CONFIG.linux.format}`,
@@ -265,13 +336,10 @@ async function convertIconFormat(
 
     // macOS
     const macIconPath = await applyMacOSMask(processedInputPath);
-    await icongen(macIconPath, platformOutputDir, {
-      report: false,
-      icns: { name: iconName, sizes: PLATFORM_CONFIG.macos.sizes },
-    });
-    const outputPath = path.join(
+    const outputPath = await generateMacOSIcns(
+      macIconPath,
       platformOutputDir,
-      `${iconName}${PLATFORM_CONFIG.macos.format}`,
+      iconName,
     );
     return (await fsExtra.pathExists(outputPath)) ? outputPath : null;
   } catch (error) {
@@ -288,6 +356,7 @@ async function isLinuxBundleIconReady(iconPath: string): Promise<boolean> {
   }
 
   try {
+    const sharp = await loadSharp();
     const { width, height } = await sharp(iconPath).metadata();
     return (
       width === PLATFORM_CONFIG.linux.size &&
@@ -301,14 +370,30 @@ async function isLinuxBundleIconReady(iconPath: string): Promise<boolean> {
 /**
  * Processes downloaded or local icon for platform-specific format
  */
-async function processIcon(
+export async function processIcon(
   iconPath: string,
   appName: string,
 ): Promise<string | null> {
   if (!iconPath || !appName) return iconPath;
 
+  const ext = iconPathExtension(iconPath);
+  if (ext === '.icon') {
+    if (!IS_WIN && !IS_LINUX) {
+      if (await isMacOSIconComposerPackage(iconPath)) {
+        return iconPath;
+      }
+      logger.warn(
+        '✼ --icon .icon must be an Icon Composer package (a directory containing icon.json).',
+      );
+      return null;
+    }
+    logger.warn(
+      '✼ Icon Composer .icon packages are only used on macOS. This platform will use a converted or default icon.',
+    );
+    return null;
+  }
+
   // Check if already in correct platform format
-  const ext = path.extname(iconPath).toLowerCase();
   const isCorrectFormat =
     (IS_WIN && ext === '.ico') ||
     (IS_LINUX && (await isLinuxBundleIconReady(iconPath))) ||
@@ -387,6 +472,12 @@ export async function handleIcon(
   // Handle custom icon (local file or remote URL)
   if (options.icon) {
     if (options.icon.startsWith('http')) {
+      if (isIconComposerUrl(options.icon)) {
+        logger.warn(
+          '✼ Icon Composer .icon packages cannot be downloaded from a URL; pass a local path. HTTP --icon is for ordinary images and .icns files.',
+        );
+        return '';
+      }
       const downloadedPath = await downloadIcon(options.icon);
       if (downloadedPath) {
         const result = await processIcon(downloadedPath, options.name || '');
@@ -397,6 +488,9 @@ export async function handleIcon(
     // Local file path
     const resolvedPath = path.resolve(options.icon);
     const result = await processIcon(resolvedPath, options.name || '');
+    if (iconPathExtension(resolvedPath) === '.icon' && !result) {
+      return '';
+    }
     return result || resolvedPath;
   }
 
@@ -409,8 +503,8 @@ export async function handleIcon(
     }
   }
 
-  // Try favicon from website
-  if (url && options.name) {
+  // Try favicon from website; local file/directory input has no favicon.
+  if (url && options.name && /^https?:\/\//i.test(url)) {
     const faviconPath = await tryGetFavicon(url, options.name);
     if (faviconPath) return faviconPath;
   }
@@ -550,6 +644,7 @@ async function tryResolveIconSource(
         return resolvedPath;
       }
     } catch (error: unknown) {
+      throwIfBuildCancelled();
       if (error instanceof Error) {
         const label =
           source === 'dashboard' ? 'Dashboard icon' : 'Icon service';
@@ -568,9 +663,10 @@ async function tryGetFavicon(
   url: string,
   appName: string,
 ): Promise<string | null> {
+  let spinner: ReturnType<typeof getSpinner> | undefined;
   try {
     const domain = new URL(url).hostname;
-    const spinner = getSpinner(`Fetching icon from ${domain}...`);
+    spinner = getSpinner(`Fetching icon from ${domain}...`);
 
     const isCI =
       process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true';
@@ -603,10 +699,13 @@ async function tryGetFavicon(
     spinner.warn(`No favicon found for ${domain}. Using default.`);
     return null;
   } catch (error) {
+    throwIfBuildCancelled();
     if (error instanceof Error) {
       logger.warn(`Failed to fetch favicon: ${error.message}`);
     }
     return null;
+  } finally {
+    spinner?.stop();
   }
 }
 
@@ -618,6 +717,17 @@ export async function downloadIcon(
   showSpinner = true,
   customTimeout?: number,
 ): Promise<string | null> {
+  if (isIconComposerUrl(iconUrl)) {
+    if (showSpinner) {
+      logger.warn(
+        '✼ Icon Composer .icon packages cannot be downloaded from a URL; pass a local path.',
+      );
+    }
+    return null;
+  }
+
+  throwIfBuildCancelled();
+  const buildSignal = getBuildCancellationSignal();
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
     controller.abort();
@@ -625,10 +735,10 @@ export async function downloadIcon(
 
   try {
     const response = await fetch(iconUrl, {
-      signal: controller.signal,
+      signal: buildSignal
+        ? AbortSignal.any([controller.signal, buildSignal])
+        : controller.signal,
     });
-
-    clearTimeout(timeoutId);
 
     if (!response.ok) {
       if (response.status === 404 && !showSpinner) {
@@ -653,7 +763,7 @@ export async function downloadIcon(
 
     return await saveIconFile(arrayBuffer, extension);
   } catch (error: unknown) {
-    clearTimeout(timeoutId);
+    throwIfBuildCancelled();
     if (showSpinner) {
       if (error instanceof Error && error.name === 'AbortError') {
         logger.error('Icon download timed out!');
@@ -665,6 +775,8 @@ export async function downloadIcon(
       }
     }
     return null;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 

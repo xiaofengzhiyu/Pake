@@ -69,14 +69,31 @@ export interface PakeCliOptions {
   // Linux: "deb", "appimage", "rpm", "zst" and "*-arm64" variants; Windows: "x64", "arm64"; macOS: "intel", "apple", "universal"
   targets: string;
 
+  // Windows Rust toolchain: 'msvc' (default, Tauri's recommended toolchain)
+  // or 'gnu' (MinGW/MSYS2, for machines without Visual Studio Build Tools).
+  // Undefined keeps today's msvc-only behavior. Windows only; ignored elsewhere.
+  windowsToolchain?: 'msvc' | 'gnu';
+
   // Debug mode, outputs more logs
   debug: boolean;
+
+  // Machine-readable mode: logs go to stderr, stdout carries one JSON result, default false
+  json: boolean;
+
+  // Path to a JSON config file whose fields mirror CLI options plus url
+  config?: string;
 
   /** External scripts that need to be injected into the page. */
   inject: string[];
 
+  // Download directory in the packaged app; empty uses the system default.
+  downloadDir: string;
+
   // Set Api Proxy
   proxyUrl: string;
+
+  // Prompt for HTTP Basic credentials at runtime on macOS, default false.
+  basicAuth: boolean;
 
   // Installer language, valid for Windows users, default is en-US
   installerLanguage: string;
@@ -86,6 +103,12 @@ export interface PakeCliOptions {
 
   // Launch app in incognito/private mode, default false
   incognito: boolean;
+
+  // Restore the last main-window URL on launch, default true
+  restoreLastUrl: boolean;
+
+  // Enable native WebView2 password-save prompts on Windows, default false
+  passwordAutosave: boolean;
 
   // Enable WebAssembly support (Flutter Web, etc.), default false
   wasm: boolean;
@@ -175,9 +198,10 @@ export interface WindowConfig {
   activation_shortcut: string;
   hide_on_close: boolean;
   incognito: boolean;
+  restore_last_url: boolean;
+  password_autosave: boolean;
   title?: string;
   enable_wasm: boolean;
-  enable_drag_drop: boolean;
   start_to_tray: boolean;
   force_internal_navigation: boolean;
   internal_url_regex: string;
@@ -195,6 +219,8 @@ export interface PakeConfig {
   system_tray: PlatformSpecific<boolean>;
   system_tray_path: string;
   proxy_url: string;
+  download_dir: string;
+  basic_auth: boolean;
   multi_instance: boolean;
   multi_window: boolean;
   inject?: string[];
@@ -211,8 +237,8 @@ export interface PakeTauriConfig {
     resources?: string[];
     targets?: string[];
     linux?: {
-      deb: { files?: Record<string, string> };
-      rpm?: { files?: Record<string, string> };
+      deb: { files?: Record<string, string>; desktopTemplate?: string };
+      rpm?: { files?: Record<string, string>; desktopTemplate?: string };
       [key: string]: unknown;
     };
     windows?: {

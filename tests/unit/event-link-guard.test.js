@@ -7,15 +7,25 @@ function loadEventHelpers({
   withTauri = false,
   userAgent = "Mozilla/5.0",
   initialZoom = null,
+  downloadError = null,
+  nativeDownloads = false,
+  topWindow = null,
 } = {}) {
-  const source = fs.readFileSync(
-    path.join(process.cwd(), "src-tauri/src/inject/event.js"),
-    "utf-8",
-  );
+  const source = ["link_policy.js", "event.js"]
+    .map((file) =>
+      fs.readFileSync(
+        path.join(process.cwd(), "src-tauri/src/inject", file),
+        "utf-8",
+      ),
+    )
+    .join("\n");
 
   const invokeCalls = [];
+  const nativeDownloadClicks = [];
   const invoke = (command, payload) => {
     invokeCalls.push([command, payload]);
+    if (command === "download_file" && downloadError)
+      return Promise.reject(downloadError);
     return Promise.resolve();
   };
   const eventListeners = {};
@@ -41,7 +51,17 @@ function loadEventHelpers({
       this.children = this.children.filter((item) => item !== child);
       if (child.id) elementsById.delete(child.id);
     },
-    click: () => {},
+    click() {
+      nativeDownloadClicks.push([this.href, this.download]);
+      // A transient native-download anchor still passes through document capture.
+      getClickGuard({ eventListeners })(makeClickEvent(this));
+    },
+    closest() {
+      return this;
+    },
+    getAttribute(name) {
+      return name === "href" ? this.href : "";
+    },
     set id(value) {
       this._id = value;
       elementsById.set(value, this);
@@ -56,7 +76,8 @@ function loadEventHelpers({
   const context = {
     console,
     URL,
-    Event: class {},
+    Event,
+    EventTarget,
     Notification: function Notification() {},
     setTimeout,
     clearTimeout,
@@ -66,6 +87,7 @@ function loadEventHelpers({
       language: "en-US",
     },
     window: {
+      frames: [],
       history: {
         back: () => {},
         forward: () => {},
@@ -88,6 +110,7 @@ function loadEventHelpers({
       isAuthLink: () => false,
       isAuthPopup: () => false,
       pakeConfig: {},
+      pakeNativeDownloads: nativeDownloads,
     },
     document: {
       addEventListener: registerListener,
@@ -99,6 +122,7 @@ function loadEventHelpers({
     },
   };
   context.window.navigator = context.navigator;
+  context.window.top = topWindow || context.window;
   if (withTauri) {
     context.window.__TAURI__ = {
       core: { invoke },
@@ -113,7 +137,13 @@ function loadEventHelpers({
   }
 
   runInNewContext(source, context);
-  return { ...context, eventListeners, invokeCalls, localStorageValues };
+  return {
+    ...context,
+    eventListeners,
+    invokeCalls,
+    localStorageValues,
+    nativeDownloadClicks,
+  };
 }
 
 function runDomReady(context) {
@@ -146,6 +176,250 @@ function makeClickEvent(anchor) {
 }
 
 describe("event link guard", () => {
+  it("uses native Windows downloads once for same-origin files without IPC", () => {
+    const context = loadEventHelpers({
+      withTauri: true,
+      nativeDownloads: true,
+    });
+    runDomReady(context);
+    const anchor = makeAnchor("https://example.com/report.pdf", "_self");
+    anchor.download = "report.pdf";
+    const click = makeClickEvent(anchor);
+    getClickGuard(context)(click);
+    expect(click.preventDefault).toHaveBeenCalledOnce();
+    expect(context.nativeDownloadClicks).toEqual([[anchor.href, "report.pdf"]]);
+    expect(
+      context.invokeCalls.filter(([command]) => command === "download_file"),
+    ).toEqual([]);
+  });
+
+  it("keeps cross-origin forced downloads on HTTP when the browser may preview them", () => {
+    const context = loadEventHelpers({
+      withTauri: true,
+      nativeDownloads: true,
+    });
+    runDomReady(context);
+    const anchor = makeAnchor("https://cdn.example.com/report.pdf", "_self");
+    anchor.download = "report.pdf";
+    getClickGuard(context)(makeClickEvent(anchor));
+    expect(context.nativeDownloadClicks).toEqual([]);
+    expect(
+      context.invokeCalls.filter(([command]) => command === "download_file"),
+    ).toEqual([
+      [
+        "download_file",
+        {
+          params: {
+            url: anchor.href,
+            filename: "report.pdf",
+            language: "en-US",
+            user_agent: "Mozilla/5.0",
+            page_url: "https://example.com/app",
+          },
+        },
+      ],
+    ]);
+  });
+
+  it.each([
+    'download_file not allowed on window "pake", webview "pake", URL: https://other.example/',
+    "Command download_file not allowed by ACL",
+  ])(
+    "falls back once to browser downloads on ACL denial: %s",
+    async (downloadError) => {
+      const context = loadEventHelpers({ withTauri: true, downloadError });
+      runDomReady(context);
+      const anchor = makeAnchor("https://example.com/report.pdf", "_self");
+      anchor.download = "report.pdf";
+      getClickGuard(context)(makeClickEvent(anchor));
+      await vi.waitFor(() =>
+        expect(context.nativeDownloadClicks).toEqual([
+          [anchor.href, "report.pdf"],
+        ]),
+      );
+      expect(
+        context.invokeCalls.filter(([command]) => command === "download_file"),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("does not retry failed HTTP downloads through the browser", async () => {
+    const context = loadEventHelpers({
+      withTauri: true,
+      downloadError: "Download failed with HTTP status 403 Forbidden",
+    });
+    runDomReady(context);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      getClickGuard(context)(
+        makeClickEvent(makeAnchor("https://example.com/report.pdf", "_self")),
+      );
+      await vi.waitFor(() => expect(log).toHaveBeenCalled());
+      expect(context.nativeDownloadClicks).toEqual([]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it.each([undefined, "", "  ", "about:blank", "about:blank#download"])(
+    "preserves a native blank popup proxy for %s",
+    (url) => {
+      const context = loadEventHelpers({ withTauri: true });
+      const popup = { location: { href: "about:blank" } };
+      const nativeOpen = vi.fn(() => popup);
+      context.window.open = nativeOpen;
+      runDomReady(context);
+      const result = context.window.open(url, "_blank");
+      expect(result).toBe(popup);
+      expect(nativeOpen).toHaveBeenCalledWith(
+        url === undefined || !url.trim() ? "about:blank" : url,
+        "_blank",
+        undefined,
+      );
+      result.location.href = "https://cdn.example.net/attachment";
+      expect(context.window.location.href).toBe("https://example.com/app");
+      expect(
+        context.invokeCalls.filter(([cmd]) => cmd === "plugin:shell|open"),
+      ).toEqual([]);
+    },
+  );
+
+  it.each(["https://outside.example/report", "https://example.com/report"])(
+    "retains the default route for a new named context: %s",
+    (url) => {
+      const context = loadEventHelpers({ withTauri: true });
+      context.window.open = vi.fn(() => null);
+      runDomReady(context);
+      context.window.open(url, "reportWindow");
+      if (url.startsWith("https://outside.example/")) {
+        expect(context.invokeCalls).toContainEqual([
+          "plugin:shell|open",
+          { path: url },
+        ]);
+      } else {
+        expect(context.window.location.href).toBe(url);
+      }
+    },
+  );
+
+  it.each([
+    ["internal", "https://example.com/forced", {}],
+    ["auth", "https://accounts.google.com/o/oauth2/auth", {}],
+    [
+      "forced internal",
+      "https://outside.example/forced",
+      { force_internal_navigation: true },
+    ],
+    [
+      "regex internal",
+      "https://outside.example/forced",
+      { internal_url_regex: "outside\\.example" },
+    ],
+  ])(
+    "rejects forged %s frame messages without navigating or opening windows",
+    (_kind, url, config) => {
+      const context = loadEventHelpers({
+        withTauri: true,
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_5)",
+      });
+      context.window.pakeConfig = config;
+      context.window.isAuthLink = context.window.isAuthPopup = (value) =>
+        value.includes("accounts.google.com");
+      const nativeOpen = vi.fn(() => ({}));
+      context.window.open = nativeOpen;
+      runDomReady(context);
+      const frame = { frames: [] };
+      context.window.frames.push(frame);
+      context.eventListeners.message[0].handler({
+        source: frame,
+        data: { type: "pake:frame-external-link", url },
+      });
+      expect(context.window.location.href).toBe("https://example.com/app");
+      expect(nativeOpen).not.toHaveBeenCalled();
+      expect(
+        context.invokeCalls.filter(
+          ([command]) => command === "plugin:shell|open",
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  it("routes early frame messages once after readiness and rechecks live sources", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    const live = { frames: [] };
+    const removed = { frames: [] };
+    context.window.frames.push(live, removed);
+    const listener = context.eventListeners.message?.[0]?.handler;
+    expect(listener).toBeTypeOf("function");
+    for (const [source, suffix] of [
+      [live, "first"],
+      [live, "second"],
+      [removed, "removed"],
+    ]) {
+      listener({
+        source,
+        data: {
+          type: "pake:frame-external-link",
+          url: `https://outside.example/${suffix}`,
+        },
+      });
+    }
+    expect(context.invokeCalls).toEqual([]);
+    context.window.frames.pop();
+    runDomReady(context);
+    expect(
+      context.invokeCalls.filter(
+        ([command]) => command === "plugin:shell|open",
+      ),
+    ).toEqual([
+      ["plugin:shell|open", { path: "https://outside.example/first" }],
+      ["plugin:shell|open", { path: "https://outside.example/second" }],
+    ]);
+    expect(context.eventListeners.DOMContentLoaded).toHaveLength(1);
+  });
+
+  it("discards a departing document's queued frame messages", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    const frame = { frames: [] };
+    context.window.frames.push(frame);
+    const listener = context.eventListeners.message?.[0]?.handler;
+    expect(listener).toBeTypeOf("function");
+    listener({
+      source: frame,
+      data: {
+        type: "pake:frame-external-link",
+        url: "https://outside.example/old",
+      },
+    });
+    context.eventListeners.pagehide[0].handler();
+    runDomReady(context);
+    expect(
+      context.invokeCalls.filter(
+        ([command]) => command === "plugin:shell|open",
+      ),
+    ).toEqual([]);
+  });
+
+  it("routes only descendant-frame messages with supported URL protocols", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    runDomReady(context);
+    const frame = { frames: [] };
+    context.window.frames.push(frame);
+    const listener = context.eventListeners.message[0].handler;
+    const send = (source, url) =>
+      listener({ source, data: { type: "pake:frame-external-link", url } });
+    send(frame, "https://outside.example/article");
+    expect(context.invokeCalls).toContainEqual([
+      "plugin:shell|open",
+      { path: "https://outside.example/article" },
+    ]);
+    const count = context.invokeCalls.length;
+    send({ frames: [] }, "https://outside.example/unrelated");
+    send(frame, "file:///tmp/example");
+    send(frame, "javascript:alert(1)");
+    send(null, "https://outside.example/opaque");
+    expect(context.invokeCalls).toHaveLength(count);
+  });
   it("falls back from malformed saved zoom values", () => {
     const context = loadEventHelpers({
       withTauri: true,
@@ -182,6 +456,184 @@ describe("event link guard", () => {
     );
   });
 
+  it("navigates GitHub release pages instead of downloading them as documents", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.location.href = "https://github.com/owner/repo/releases";
+    runDomReady(context);
+
+    const event = makeClickEvent(
+      makeAnchor("https://github.com/owner/repo/releases/tag/v1.28.3", "_self"),
+    );
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(event.stopImmediatePropagation).not.toHaveBeenCalled();
+    expect(context.invokeCalls).not.toContainEqual([
+      "download_file",
+      expect.anything(),
+    ]);
+  });
+
+  it("still downloads files linked from GitHub releases", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.location.href = "https://github.com/owner/repo/releases";
+    runDomReady(context);
+
+    const event = makeClickEvent(
+      makeAnchor(
+        "https://github.com/owner/repo/releases/download/v1.28.3/app.dmg",
+        "_self",
+      ),
+    );
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(event.stopImmediatePropagation).toHaveBeenCalled();
+    expect(context.invokeCalls).toContainEqual([
+      "download_file",
+      {
+        params: {
+          url: "https://github.com/owner/repo/releases/download/v1.28.3/app.dmg",
+          filename: "app.dmg",
+          language: "en-US",
+          page_url: "https://github.com/owner/repo/releases",
+          user_agent: "Mozilla/5.0",
+        },
+      },
+    ]);
+  });
+
+  it("navigates SPA routes under /assets/ instead of treating them as downloads", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.location.href = "https://www.mexc.com/";
+    context.window.location.origin = "https://www.mexc.com";
+    context.window.location.pathname = "/";
+    runDomReady(context);
+
+    const event = makeClickEvent(
+      makeAnchor("https://www.mexc.com/assets/future", "_self"),
+    );
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(context.invokeCalls).not.toContainEqual([
+      "download_file",
+      expect.anything(),
+    ]);
+    expect(
+      context.isDownloadableFile("https://www.mexc.com/assets/future"),
+    ).toBe(false);
+  });
+
+  it("still downloads real files that live under /assets/ by extension", () => {
+    const { isDownloadableFile } = loadEventHelpers();
+
+    expect(
+      isDownloadableFile("https://cdn.example.com/assets/export/report.pdf"),
+    ).toBe(true);
+    expect(
+      isDownloadableFile("https://cdn.example.com/assets/pkg/app.zip"),
+    ).toBe(true);
+  });
+
+  it("keeps intentional download-path interception for extensionless /download/ links", () => {
+    const { isDownloadableFile } = loadEventHelpers();
+
+    expect(isDownloadableFile("https://example.com/download/export")).toBe(
+      true,
+    );
+    // Real files under /files/ still match by extension, not the path root.
+    expect(isDownloadableFile("https://example.com/files/report.pdf")).toBe(
+      true,
+    );
+  });
+
+  it("does not treat /files/ SPA routes without a file extension as downloads", () => {
+    const { isDownloadableFile } = loadEventHelpers();
+
+    expect(isDownloadableFile("https://drive.example.com/files/inbox")).toBe(
+      false,
+    );
+    expect(
+      isDownloadableFile("https://app.example.com/attachments/latest"),
+    ).toBe(false);
+  });
+
+  it("does not treat static /dist/ SPA paths as downloads without a file extension", () => {
+    const { isDownloadableFile } = loadEventHelpers();
+
+    expect(isDownloadableFile("https://example.com/dist/app")).toBe(false);
+  });
+
+  it("does not force-download ordinary links on Cmd/Ctrl+click", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    runDomReady(context);
+
+    const event = makeClickEvent(
+      makeAnchor("https://example.com/app/settings", "_self"),
+    );
+    event.metaKey = true;
+    event.ctrlKey = true;
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(context.invokeCalls).not.toContainEqual([
+      "download_file",
+      expect.anything(),
+    ]);
+  });
+
+  it("still downloads when the anchor has a download attribute", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    runDomReady(context);
+
+    const anchor = makeAnchor("https://example.com/app/settings", "_self");
+    anchor.download = "settings.html";
+    const event = makeClickEvent(anchor);
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(context.invokeCalls).toContainEqual([
+      "download_file",
+      {
+        params: {
+          url: "https://example.com/app/settings",
+          filename: "settings.html",
+          language: "en-US",
+          page_url: "https://example.com/app",
+          user_agent: "Mozilla/5.0",
+        },
+      },
+    ]);
+  });
+
+  it("does not treat navigable web formats as downloads by extension alone", () => {
+    const { isDownloadableFile } = loadEventHelpers();
+
+    expect(isDownloadableFile("https://example.com/api/config.json")).toBe(
+      false,
+    );
+    expect(isDownloadableFile("https://example.com/docs/app.js")).toBe(false);
+    expect(isDownloadableFile("https://example.com/theme.css")).toBe(false);
+    // Binary / archive extensions still download.
+    expect(isDownloadableFile("https://example.com/report.pdf")).toBe(true);
+    expect(isDownloadableFile("https://example.com/pkg.zip")).toBe(true);
+  });
+
+  it("scopes root domains correctly for multi-part public suffixes", () => {
+    const { getRootDomain } = loadEventHelpers();
+
+    expect(getRootDomain("www.amazon.co.uk")).toBe("amazon.co.uk");
+    expect(getRootDomain("evil.co.uk")).toBe("evil.co.uk");
+    expect(getRootDomain("www.amazon.co.uk")).not.toBe(
+      getRootDomain("evil.co.uk"),
+    );
+    expect(getRootDomain("alice.github.io")).toBe("alice.github.io");
+    expect(getRootDomain("bob.github.io")).toBe("bob.github.io");
+    expect(getRootDomain("m.bilibili.com")).toBe("bilibili.com");
+    expect(getRootDomain("www.bilibili.com")).toBe("bilibili.com");
+  });
+
   it("navigates macOS auth URLs in the current window", () => {
     const { openAuthNavigation, window } = loadEventHelpers({
       userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_5)",
@@ -202,6 +654,49 @@ describe("event link guard", () => {
     expect(openCalls).toEqual([]);
     expect(window.location.href).toBe("https://www.linkedin.com/login");
     expect(result).toBe(window);
+  });
+
+  it("navigates Linux auth URLs in the current window", () => {
+    const { openAuthNavigation, window } = loadEventHelpers({
+      userAgent: "Mozilla/5.0 (X11; Linux x86_64)",
+    });
+    const originalWindowOpen = vi.fn(() => ({}));
+
+    const result = openAuthNavigation(
+      originalWindowOpen,
+      "https://accounts.google.com/o/oauth2/auth",
+      "_blank",
+      "width=1200,height=800",
+    );
+
+    expect(originalWindowOpen).not.toHaveBeenCalled();
+    expect(window.location.href).toBe(
+      "https://accounts.google.com/o/oauth2/auth",
+    );
+    expect(result).toBe(window);
+  });
+
+  it("keeps Windows auth URLs on the native popup path", () => {
+    const popup = {};
+    const { openAuthNavigation, window } = loadEventHelpers({
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    });
+    const originalWindowOpen = vi.fn(() => popup);
+
+    const result = openAuthNavigation(
+      originalWindowOpen,
+      "https://accounts.google.com/o/oauth2/auth",
+      "_blank",
+      "width=1200,height=800",
+    );
+
+    expect(originalWindowOpen).toHaveBeenCalledWith(
+      "https://accounts.google.com/o/oauth2/auth",
+      "_blank",
+      "width=1200,height=800",
+    );
+    expect(window.location.href).toBe("https://example.com/app");
+    expect(result).toBe(popup);
   });
 
   it("keeps blank macOS auth popups on the native popup path", () => {
@@ -369,6 +864,36 @@ describe("event link guard", () => {
     ]);
   });
 
+  it("hands external links from a subframe to the top page instead of IPC", () => {
+    // WebView2 injects event.js into subframes, whose origin has no IPC grant.
+    const messages = [];
+    const context = loadEventHelpers({
+      withTauri: true,
+      topWindow: { postMessage: (message) => messages.push(message) },
+    });
+    runDomReady(context);
+
+    expect(context.window.open("https://outside.example/launch")).toBeNull();
+    const event = makeClickEvent(
+      makeAnchor("https://outside.example/page", "_new"),
+    );
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(messages).toEqual([
+      {
+        type: "pake:frame-external-link",
+        url: "https://outside.example/launch",
+      },
+      { type: "pake:frame-external-link", url: "https://outside.example/page" },
+    ]);
+    expect(
+      context.invokeCalls.filter(
+        ([command]) => command === "plugin:shell|open",
+      ),
+    ).toEqual([]);
+  });
+
   it("bridges Web Badging API calls to explicit badge commands", async () => {
     const { navigator, invokeCalls } = loadEventHelpers({ withTauri: true });
 
@@ -395,9 +920,12 @@ describe("event link guard", () => {
         "send_notification",
         {
           params: {
+            // Correlates the native click callback back to this instance.
+            id: expect.stringMatching(/^[A-Za-z0-9_-]{1,64}$/),
             title: "Hello",
             body: "World",
             icon: "https://example.com/icon.png",
+            silent: false,
           },
         },
       ],
@@ -428,5 +956,60 @@ describe("getFilenameFromUrl data URI extension", () => {
     const filename = context.getFilenameFromUrl("data:image/png,rawdata");
     expect(filename).toMatch(/^image-.*\.png$/);
     expect(filename).not.toContain("data:image/");
+  });
+});
+
+describe("getFilenameFromUrl percent-encoded path", () => {
+  it("decodes the file name the way browsers name downloads", () => {
+    const context = loadEventHelpers();
+    expect(
+      context.getFilenameFromUrl(
+        "https://example.com/files/Annual%20Report%202026.pdf",
+      ),
+    ).toBe("Annual Report 2026.pdf");
+    expect(
+      context.getFilenameFromUrl("https://example.com/%E6%8A%A5%E5%91%8A.pdf"),
+    ).toBe("报告.pdf");
+  });
+
+  it.each(["a%2F..%2Fsecret.pdf", "bad%E0%A4.pdf", "%E2%80%AEfdp.pdf"])(
+    "keeps the encoded name when decoding is unsafe or malformed: %s",
+    (name) => {
+      const context = loadEventHelpers();
+      expect(
+        context.getFilenameFromUrl(`https://example.com/files/${name}`),
+      ).toBe(name);
+    },
+  );
+
+  it("passes the decoded name to download_file", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    runDomReady(context);
+    const anchor = makeAnchor(
+      "https://example.com/files/Annual%20Report.pdf",
+      "_self",
+    );
+    getClickGuard(context)(makeClickEvent(anchor));
+    expect(
+      context.invokeCalls
+        .filter(([command]) => command === "download_file")
+        .map(([, payload]) => payload.params.filename),
+    ).toEqual(["Annual Report.pdf"]);
+  });
+
+  it("names native Windows downloads with the decoded name", () => {
+    const context = loadEventHelpers({
+      withTauri: true,
+      nativeDownloads: true,
+    });
+    runDomReady(context);
+    const anchor = makeAnchor(
+      "https://example.com/files/%E6%8A%A5%E5%91%8A%202026.pdf",
+      "_self",
+    );
+    getClickGuard(context)(makeClickEvent(anchor));
+    expect(context.nativeDownloadClicks).toEqual([
+      [anchor.href, "报告 2026.pdf"],
+    ]);
   });
 });

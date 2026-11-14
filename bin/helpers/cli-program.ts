@@ -1,5 +1,5 @@
 import chalk from 'chalk';
-import { program, Option } from 'commander';
+import { program, InvalidArgumentError, Option } from 'commander';
 import packageJson from '../../package.json';
 import { DEFAULT_PAKE_OPTIONS as DEFAULT } from '../defaults';
 import { validateNumberInput, validateUrlInput } from '../utils/validate';
@@ -26,7 +26,11 @@ ${green('|_|   \\__,_|_|\\_\\___|  can turn any webpage into a desktop app with 
         'Application identifier / bundle ID',
       ).hideHelp(),
     )
-    .option('--icon <string>', 'Application icon', DEFAULT.icon)
+    .option(
+      '--icon <string>',
+      'Application icon (.icns / .icon on macOS, .ico on Windows, .png on Linux)',
+      DEFAULT.icon,
+    )
     .option(
       '--width <number>',
       'Window width',
@@ -69,7 +73,29 @@ ${green('|_|   \\__,_|_|\\_\\___|  can turn any webpage into a desktop app with 
       },
       DEFAULT.inject,
     )
+    .option(
+      '--download-dir <path>',
+      'App download directory (absolute path or ~/path; default: system Downloads)',
+      DEFAULT.downloadDir,
+    )
     .option('--debug', 'Debug build and more output', DEFAULT.debug)
+    .option(
+      '--json',
+      'Machine-readable output: logs to stderr, one JSON result on stdout',
+      DEFAULT.json,
+    )
+    .option(
+      '--config <path>',
+      'Load options from a JSON config file (fields mirror CLI options, see schema/pake.schema.json)',
+    )
+    .addOption(
+      new Option(
+        '--basic-auth',
+        'Prompt for HTTP Basic credentials at runtime (macOS only)',
+      )
+        .default(DEFAULT.basicAuth)
+        .hideHelp(),
+    )
     .addOption(
       new Option(
         '--proxy-url <url>',
@@ -88,6 +114,12 @@ ${green('|_|   \\__,_|_|\\_\\___|  can turn any webpage into a desktop app with 
         '--targets <string>',
         'Build target format for your system',
       ).default(DEFAULT.targets),
+    )
+    .addOption(
+      new Option(
+        '--windows-toolchain <toolchain>',
+        'Windows Rust toolchain: msvc (default, requires Visual Studio Build Tools) or gnu (MinGW/MSYS2, for machines without them)',
+      ).choices(['msvc', 'gnu']),
     )
     .addOption(
       new Option(
@@ -145,14 +177,32 @@ ${green('|_|   \\__,_|_|\\_\\___|  can turn any webpage into a desktop app with 
           if (value === undefined) return true; // --hide-on-close without value
           if (value === 'true') return true;
           if (value === 'false') return false;
-          throw new Error('--hide-on-close must be true or false');
+          throw new InvalidArgumentError(
+            '--hide-on-close must be true or false',
+          );
         })
         .hideHelp(),
     )
     .addOption(new Option('--title <string>', 'Window title').hideHelp())
     .addOption(
+      new Option(
+        '--no-restore-last-url',
+        'Open the packaged URL on launch while keeping cookies and storage',
+      )
+        .default(DEFAULT.restoreLastUrl)
+        .hideHelp(),
+    )
+    .addOption(
       new Option('--incognito', 'Launch app in incognito/private mode')
         .default(DEFAULT.incognito)
+        .hideHelp(),
+    )
+    .addOption(
+      new Option(
+        '--password-autosave',
+        'Enable native password-save prompts on Windows',
+      )
+        .default(DEFAULT.passwordAutosave)
         .hideHelp(),
     )
     .addOption(
@@ -161,7 +211,10 @@ ${green('|_|   \\__,_|_|\\_\\___|  can turn any webpage into a desktop app with 
         .hideHelp(),
     )
     .addOption(
-      new Option('--enable-drag-drop', 'Enable drag and drop functionality')
+      new Option(
+        '--enable-drag-drop',
+        'Deprecated and ignored: pages handle drag and drop by default',
+      )
         .default(DEFAULT.enableDragDrop)
         .hideHelp(),
     )
@@ -233,7 +286,9 @@ ${green('|_|   \\__,_|_|\\_\\___|  can turn any webpage into a desktop app with 
         .argParser((value) => {
           const zoom = Number(value);
           if (!Number.isInteger(zoom) || zoom < 50 || zoom > 200) {
-            throw new Error('--zoom must be an integer between 50 and 200');
+            throw new InvalidArgumentError(
+              '--zoom must be an integer between 50 and 200',
+            );
           }
           return zoom;
         })
